@@ -19,6 +19,7 @@
 - Script `buildCaseStatement.sh` to help with creating labels have been improved.
 - Fixed a bug in a variable name that prevented updateTool to be used
 - added `type` variable for value `"updateronly"` if the label should only run an updater tool.
+- Added variable `TIMEOUT` that can be set to the number of seconds after which the dialogue box will give up waiting for a button click. This prevents the script from blocking other processes while the user ignores the dialogue box for a prolonged period of time.
 
 
 ## v0.4 - 2020-10-19
