@@ -7,7 +7,7 @@ label="" # if no label is sent to the script, this will be used
 # 2020-2021 Installomator
 #
 # inspired by the download scripts from William Smith and Sander Schram
-# 
+#
 # Contributers:
 #    Armin Briegel - @scriptingosx
 #    Isaac Ordonez - @issacatmann
@@ -23,7 +23,7 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # set to 0 for production, 1 or 2 for debugging
 # while debugging, items will be downloaded to the parent directory of this script
 # also no actual installation will be performed
-# debug mode 1 will download to the directory the script is run in, but will not check the version 
+# debug mode 1 will download to the directory the script is run in, but will not check the version
 # debug mode 2 will download to the temp directory, check for blocking processes, check the version, but will not install anything or remove the current version
 DEBUG=1
 
@@ -70,6 +70,10 @@ BLOCKING_PROCESS_ACTION=tell_user
 #                  but user is only allowed to Quit and Continue. If the quitting fails,
 #                  the blocking processes will be terminated.
 #   - kill         kill process without prompting or giving the user a chance to save
+#
+# Please note that there's no real distinction any more between quit, quit_kill and kill
+# since per default now two quit attempts are made followed by 3 attempts to kill the
+# process nicely (SIGTERM) and if this doesn't work hard (SIGKILL)
 
 
 # logo-icon used in dialog boxes if app is blocking
@@ -185,7 +189,7 @@ IGNORE_DND_APPS=""
 #   How we get version number from app. Possible values:
 #     - CFBundleShortVersionString
 #     - CFBundleVersion
-#   Not all software titles uses fields the same. 
+#   Not all software titles uses fields the same.
 #   See Opera label.
 #
 # - appCustomVersion(){}: (optional function)
@@ -330,7 +334,7 @@ cleanupAndExit() { # $1 = exit code, $2 message, $3 level
         printlog "$2" $3
     fi
     printlog "################## End Installomator, exit code $1 \n" REQ
-    
+
     # if label is wrong and we wanted name of the label, then return ##################
     if [[ $RETURN_LABEL_NAME -eq 1 ]]; then
         1=0 # If only label name should be returned we exit without any errors
@@ -590,6 +594,71 @@ getAppVersion() {
     fi
 }
 
+QuitOrKillGently() {
+	# function that gets called with process name as $1
+	printlog "telling app \"$1\" to quit"
+	runAsUser osascript -e "tell app \"$1\" to quit"
+	sleep 5
+	if pgrep -xq "$1"; then
+		runAsUser osascript -e "tell app \"$1\" to quit"
+		sleep 5
+	fi
+
+	# walk through all processes that can be found using pgrep and first send them a
+	# SIGTERM and after 3 seconds a SIGKILL
+	RemainingPIDs=($(pgrep "$1"))
+	Iteration=0
+	while [ ${#RemainingPIDs[@]} -gt 0 -a ${Iteration} -lt 3 ] ; do
+		for PID in ${RemainingPIDs} ; do
+			Process="$(ps ${PID} | awk -F" /" "/${PID}/ {print \"/\"\$2}")"
+			printlog "sending SIGTERM to PID ${PID}: ${Process}"
+			kill ${PID}
+		done
+		sleep 5
+		RemainingPIDs=($(pgrep "$1"))
+		for PID in ${RemainingPIDs} ; do
+			Process="$(ps ${PID} | awk -F" /" "/${PID}/ {print \"/\"\$2}")"
+			printlog "sending SIGKILL to PID ${PID}: ${Process}"
+			kill -9 ${PID}
+		done
+		sleep 3
+		RemainingPIDs=($(pgrep "$1"))
+		((Iteration++))
+	done
+} # QuitOrKillGently
+
+DealWithLaunchDaemon() {
+	# function that stops/starts launchdaemons that could otherwise interfere with install
+	# $1 is name of plist, $2 is stop/start
+
+	[ -f "$1" ] && LaunchDaemonLabel="$(defaults read "$1" Label 2>/dev/null)"
+
+	if [ "${LaunchDaemonLabel}" = "X" ]; then
+		printlog "$1 not found or not readable. Skipping"
+	else
+		case $2 in
+			stop)
+				# unload LaunchDaemon when running
+				launchctl list | grep -q "${LaunchDaemonLabel}$"
+				if [ $? -eq 0 ]; then
+					launchctl unload -w "$1" && printlog "Unloaded ${LaunchDaemonLabel}" || printlog "Unloading ${LaunchDaemonLabel} failed"
+				else
+					printlog "${LaunchDaemonLabel} not running, nothing to do"
+				fi
+				;;
+			start)
+				# load LaunchDaemon again if not already running
+				launchctl list | grep -q "${LaunchDaemonLabel}$"
+				if [ $? -ne 0 ]; then
+					launchctl load -w "$1" && printlog "Restarted ${LaunchDaemonLabel}" || printlog "Restarting ${LaunchDaemonLabel} failed"
+				else
+					printlog "${LaunchDaemonLabel} already running, nothing to do"
+				fi
+				;;
+		esac
+	fi
+} # DealWithLaunchDaemon
+
 checkRunningProcesses() {
     # don't check in DEBUG mode 1
     if [[ $DEBUG -eq 1 ]]; then
@@ -597,47 +666,32 @@ checkRunningProcesses() {
         return
     fi
 
+	# unload LaunchDaemons that could interfere with installation
+	for x in ${LaunchDaemonsToUnload}; do
+		DealWithLaunchDaemon "$x" stop
+	done
+
+	# stop/remove user LaunchAgents that could interfere with installation
+	for x in ${LaunchAgentsToStop}; do
+	    printlog "stopping $x LaunchAgent"
+		runAsUser launchctl stop "$x"
+		runAsUser launchctl remove "$x"
+	done
+
     # try at most 3 times
     for i in {1..4}; do
-        countedProcesses=0
         for x in ${blockingProcesses}; do
             if pgrep -xq "$x"; then
                 printlog "found blocking process $x"
                 appClosed=1
 
                 case $BLOCKING_PROCESS_ACTION in
-                    quit|quit_kill)
-                        printlog "telling app $x to quit"
-                        runAsUser osascript -e "tell app \"$x\" to quit"
-                        if [[ $i > 2 && $BLOCKING_PROCESS_ACTION = "quit_kill" ]]; then
-                          printlog "Changing BLOCKING_PROCESS_ACTION to kill"
-                          BLOCKING_PROCESS_ACTION=kill
-                        else
-                            # give the user a bit of time to quit apps
-                            printlog "waiting 30 seconds for processes to quit"
-                            sleep 30
-                        fi
-                        ;;
-                    kill)
-                      printlog "killing process $x"
-                      pkill $x
-                      sleep 5
-                      ;;
                     prompt_user|prompt_user_then_kill)
                       button=$(displaydialog "Quit “$x” to continue updating? (Leave this dialogue if you want to activate this update later)." "The application “$x” needs to be updated.")
                       if [[ $button = "Not Now" ]]; then
                         cleanupAndExit 10 "user aborted update" ERROR
                       else
-                        if [[ $i > 2 && $BLOCKING_PROCESS_ACTION = "prompt_user_then_kill" ]]; then
-                          printlog "Changing BLOCKING_PROCESS_ACTION to kill"
-                          BLOCKING_PROCESS_ACTION=kill
-                        else
-                          printlog "telling app $x to quit"
-                          runAsUser osascript -e "tell app \"$x\" to quit"
-                          # give the user a bit of time to quit apps
-                          printlog "waiting 30 seconds for processes to quit"
-                          sleep 30
-                        fi
+                        QuitOrKillGently "$x"
                       fi
                       ;;
                     prompt_user_loop)
@@ -651,37 +705,25 @@ checkRunningProcesses() {
                           BLOCKING_PROCESS_ACTION=tell_user
                         fi
                       else
-                        printlog "telling app $x to quit"
-                        runAsUser osascript -e "tell app \"$x\" to quit"
-                        # give the user a bit of time to quit apps
-                        printlog "waiting 30 seconds for processes to quit"
-                        sleep 30
+                        QuitOrKillGently "$x"
                       fi
                       ;;
                     tell_user|tell_user_then_kill)
                       button=$(displaydialogContinue "Quit “$x” to continue updating? (This is an important update). Wait for notification of update before launching app again." "The application “$x” needs to be updated.")
-                      printlog "telling app $x to quit"
-                      runAsUser osascript -e "tell app \"$x\" to quit"
-                      # give the user a bit of time to quit apps
-                      printlog "waiting 30 seconds for processes to quit"
-                      sleep 30
-                      if [[ $i > 1 && $BLOCKING_PROCESS_ACTION = tell_user_then_kill ]]; then
-                          printlog "Changing BLOCKING_PROCESS_ACTION to kill"
-                          BLOCKING_PROCESS_ACTION=kill
-                      fi
+                      QuitOrKillGently "$x"
+                      ;;
+                    kill|quit|quit_kill)
+                       QuitOrKillGently "$x"
                       ;;
                     silent_fail)
                       cleanupAndExit 12 "blocking process '$x' found, aborting" ERROR
                       ;;
                 esac
-
-                countedProcesses=$((countedProcesses + 1))
             fi
         done
-
     done
 
-    if [[ $countedProcesses -ne 0 ]]; then
+    if pgrep -xq "$x"; then
         cleanupAndExit 11 "could not quit all processes, aborting..." ERROR
     fi
 
@@ -691,6 +733,11 @@ checkRunningProcesses() {
 reopenClosedProcess() {
     # If Installomator closed any processes, let's get the app opened again
     # credit: Søren Theilgaard (@theilgaard)
+
+	# restart LaunchDaemons that were stopped prior to install
+	for x in ${LaunchDaemonsToUnload}; do
+		DealWithLaunchDaemon "$x" start
+	done
 
     # don't reopen if REOPEN is not "yes"
     if [[ $REOPEN != yes ]]; then
@@ -1303,7 +1350,8 @@ valuesfromarguments)
     downloadURL="https://app-updates.agilebits.com/download/OPM7"
     appNewVersion=$( curl -fsIL "${downloadURL}" | grep -i "^location" | awk '{print $2}' | sed -E 's/.*\/[0-9a-zA-Z]*-([0-9.]*)\..*/\1/g' )
     expectedTeamID="2BUA8C4S2C"
-    blockingProcesses=( "1Password Extension Helper" "1Password 7" "1Password (Safari)" "1PasswordNativeMessageHost" "1PasswordSafariAppExtension" )
+	LaunchAgentsToStop=( 2BUA8C4S2C.com.agilebits.onepassword7-helper )
+    blockingProcesses=( "Safari" "1Password (Safari)" "1PasswordSafariAppExtension" "Google Chrome" "firefox" "1Password 7" "1Password Extension Helper" )
     #forcefulQuit=YES
     ;;
 1password8)
@@ -1318,7 +1366,7 @@ valuesfromarguments)
         downloadURL="https://downloads.1password.com/mac/1Password-latest-x86_64.zip"
     fi
     expectedTeamID="2BUA8C4S2C"
-    blockingProcesses=( "1Password Extension Helper" "1Password 7" "1Password" "1Password (Safari)" "1PasswordNativeMessageHost" "1PasswordSafariAppExtension" )
+    blockingProcesses=( "1Password Extension Helper" "1Password 7" "1Password" "1Password (Safari)" "1PasswordSafariAppExtension" )
     #forcefulQuit=YES
     ;;
 1passwordcli)
@@ -1691,7 +1739,6 @@ axurerp10)
     expectedTeamID="HUMW6UU796"
     versionKey="CFBundleVersion"
     appName="Axure RP 10.app"
-    blockingProcesses=( "Axure RP 10" )
     ;;
 balenaetcher)
     name="balenaEtcher"
@@ -1811,7 +1858,6 @@ caffeine)
     downloadURL=$(downloadURLFromGit IntelliScape caffeine)
     appNewVersion=$(versionFromGit IntelliScape caffeine)
     expectedTeamID="YD6LEYT6WZ"
-    blockingProcesses=( Caffeine )
     ;;
 cakebrew)
     name="Cakebrew"
@@ -1936,6 +1982,7 @@ cloudya)
     type="appInDmgInZip"
     downloadURL="$(curl -fs https://www.nfon.com/de/service/downloads | grep -i -E -o "https://cdn.cloudya.com/Cloudya-[.0-9]+-mac.zip")"
     appNewVersion="$(curl -fs https://www.nfon.com/de/service/downloads | grep -i -E -o "Cloudya Desktop App MAC [0-9.]*" | sed 's/^.*\ \([^ ]\{0,7\}\)$/\1/g')"
+	LaunchDaemonsToUnload=( /Library/LaunchDaemons/de.arts-others.macos-security-update-notifier.plist )
     expectedTeamID="X26F74J8TH"
     ;;
 clue)
@@ -2167,7 +2214,6 @@ drawio)
     downloadURL="$(downloadURLFromGit jgraph drawio-desktop)"
     appNewVersion="$(versionFromGit jgraph drawio-desktop)"
     expectedTeamID="UZEUFB4N53"
-    blockingProcesses=( draw.io )
     ;;
 drift)
     # credit Elena Ackley (@elenaelago)
@@ -2224,7 +2270,6 @@ egnytewebedit)
     appName="Egnyte WebEdit.app"
     blockingProcesses=( NONE )
     ;;
-    
 element)
     name="Element"
     type="dmg"
@@ -2464,7 +2509,6 @@ flux)
     downloadURL="https://justgetflux.com/mac/Flux.zip"
     expectedTeamID="VZKSA7H9J9"
     ;;
-    
 flycut)
     name="Flycut"
     type="zip"
@@ -3116,9 +3160,7 @@ linear)
     expectedTeamID="7VZ2S3V9RV"
     versionKey="CFBundleShortVersionString"
     appName="Linear.app"
-    blockingProcesses=( "Linear" )
     ;;
-    
 logioptions|\
 logitechoptions)
     name="Logi Options"
@@ -3300,7 +3342,6 @@ azuredatastudio)
     appNewVersion=$(versionFromGit microsoft azuredatastudio )
     expectedTeamID="UBF8T346G9"
     appName="Azure Data Studio.app"
-    blockingProcesses=( "Azure Data Studio" )
     ;;
 microsoftazurestorageexplorer)
     name="Microsoft Azure Storage Explorer"
@@ -4124,7 +4165,6 @@ remotedesktopmanagerenterprise)
     downloadURL=$(curl -fs https://devolutions.net/remote-desktop-manager/home/thankyou/rdmmacbin | grep -oe "http.*\.dmg" | head -1)
     appNewVersion=$(echo "$downloadURL" | sed -E 's/.*\.Mac\.([0-9.]*)\.dmg/\1/g')
     expectedTeamID="N592S9ASDB"
-    blockingProcesses=( "$name" )
     ;;
 remotedesktopmanagerfree)
     name="Remote Desktop Manager Free"
@@ -4178,14 +4218,12 @@ ringcentralapp)
         downloadURL="https://app.ringcentral.com/download/RingCentral.pkg"
     fi
     expectedTeamID="M932RC5J66"
-    blockingProcesses=( "Ringcentral" )
     ;;
 ringcentralclassicapp)
     name="Glip"
     type="dmg"
     downloadURL="https://downloads.ringcentral.com/glip/rc/GlipForMac"
     expectedTeamID="M932RC5J66"
-    blockingProcesses=( "Glip" )
     #blockingProcessesMaxCPU="5"
     ;;
 ringcentralmeetings)
@@ -4216,7 +4254,6 @@ rocketchat)
     downloadURL=$(downloadURLFromGit RocketChat Rocket.Chat.Electron)
     appNewVersion=$(versionFromGit RocketChat Rocket.Chat.Electron)
     expectedTeamID="S6UPZG7ZR3"
-    blockingProcesses=( Rocket.Chat )
     ;;
 rodeconnect)
     name="RODE Connect"
@@ -4255,7 +4292,6 @@ scaleft)
     downloadURL="https://dist.scaleft.com/client-tools/mac/latest/ScaleFT.pkg"
     appNewVersion=$(curl -sf "https://dist.scaleft.com/client-tools/mac/" | awk '/dir/{i++}i==2' | sed -nre 's/^[^0-9]*(([0-9]+\.)*[0-9]+).*/\1/p')
     expectedTeamID="HV2G9Z3RP5"
-    blockingProcesses=( ScaleFT )
     ;;
 screamingfrogseospider)
     name="Screaming Frog SEO Spider"
@@ -4292,7 +4328,6 @@ secretive)
     appNewVersion=$(versionFromGit maxgoedjen secretive)
     expectedTeamID="Z72PRUAWF6"
     ;;
-    
 sequelpro)
     name="Sequel Pro"
     type="dmg"
@@ -4492,14 +4527,12 @@ sqlpropostgres)
     type="zip"
     downloadURL="https://macpostgresclient.com/download.php"
     expectedTeamID="LKJB72232C"
-    blockingProcesses=( "SQLPro for Postgres" )
     ;;
 sqlprostudio)
     name="SQLPro Studio"
     type="zip"
     downloadURL="https://www.sqlprostudio.com/download.php"
     expectedTeamID="LKJB72232C"
-    blockingProcesses=( "SQLPro Studio" )
     ;;
 steelseriesengine)
     name="SteelSeries GG"
@@ -4820,7 +4853,6 @@ unnaturalscrollwheels)
     downloadURL="$(downloadURLFromGit ther0n UnnaturalScrollWheels)"
     appNewVersion="$(versionFromGit ther0n UnnaturalScrollWheels)"
     expectedTeamID="D6H5W2T379"
-    blockingProcesses=( UnnaturalScrollWheels )
     ;;
 utm)
     name="UTM"
@@ -5121,7 +5153,6 @@ zoomclient)
     fi
     expectedTeamID="BJ4HAAB9B3"
     #appNewVersion=$(curl -is "https://beta2.communitypatch.com/jamf/v1/ba1efae22ae74a9eb4e915c31fef5dd2/patch/zoom.us" | grep currentVersion | tr ',' '\n' | grep currentVersion | cut -d '"' -f 4) # Does not match packageID
-    blockingProcesses=( zoom.us )
     #blockingProcessesMaxCPU="5"
     ;;
 zoomgov)
