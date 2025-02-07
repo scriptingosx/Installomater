@@ -118,6 +118,8 @@ bruno
 bugdom
 burpsuitecommunityedition
 burpsuiteprofessional
+busycal
+busycontacts
 buttercup
 caffeine
 cakebrew
